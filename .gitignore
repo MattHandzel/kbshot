@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+result
+result-*
+tests/scenes/
+tests/corpus/
+tests/out/
