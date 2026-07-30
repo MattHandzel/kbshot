@@ -776,13 +776,29 @@ def _xycut(
                            max(2, min_gap // 2), min_side, max_depth)
 
 
-def source_xycut(png: Path, scale: float, detect_width: int, verbose: bool) -> list[Box]:
+def source_xycut(
+    png: Path,
+    scale: float,
+    detect_width: int,
+    verbose: bool,
+    seeds: list[Box] | None = None,
+) -> list[Box]:
     """Whitespace-defined regions: chat messages, paragraphs, columns, cards.
 
     Tiered by how much of the screen the region covers rather than by recursion
     depth, because depth is not comparable between a shallow dashboard and a
     deeply nested chat pane, whereas "this is a third of the screen" means the
     same thing in both.
+
+    `seeds` are regions to cut INSIDE, normally the window rectangles. Passing them
+    is not an optimisation, it is what makes this source work on a real desktop at
+    all. Run on the whole screen, persistent chrome bridges every gutter: a row of
+    pixels through the empty middle of the screen still crosses a full-height
+    browser sidebar, and a column still crosses the full-width taskbar, so neither
+    projection ever falls under the blank tolerance and nothing is cut. Measured on
+    a real frame, screen-level cutting produced 2 regions where per-window cutting
+    produces dozens -- while the synthetic single-app scenes, having no chrome, hid
+    the problem completely.
     """
     img = Image.open(png).convert("L")
     f = min(1.0, detect_width / img.width)
@@ -802,20 +818,28 @@ def source_xycut(png: Path, scale: float, detect_width: int, verbose: bool) -> l
     min_gap = max(2, round(10 * scale * f))
     min_side = max(6, round(12 * scale * f))
 
+    dh, dw = grey.shape
+
+    # Cut inside each window, plus the whole screen as a fallback so a compositor
+    # without window data (or --from-image) still gets something.
+    regions: list[tuple[int, int, int, int]] = [(0, 0, dw, dh)]
+    for b in seeds or []:
+        x0 = max(0, min(dw - 1, round(b.x * scale * f)))
+        y0 = max(0, min(dh - 1, round(b.y * scale * f)))
+        x1 = max(x0 + 1, min(dw, round((b.x + b.w) * scale * f)))
+        y1 = max(y0 + 1, min(dh, round((b.y + b.h) * scale * f)))
+        if (x1 - x0) >= min_side * 2 and (y1 - y0) >= min_side * 2:
+            regions.append((x0, y0, x1 - x0, y1 - y0))
+
     nodes: list[tuple[int, int, int, int, int]] = []
-    # Two edge thresholds, unioned, because one cannot serve both jobs and the
-    # measurements are unambiguous about it. At 25 the faint 1-level borders of
-    # dashboard cards are visible and cards score 20/20, but a light theme's subtle
-    # row striping also becomes "ink", which fills the gutters between table rows and
-    # collapses rows to 2/28. At 45 it is exactly reversed: rows 13/28, cards 18/20.
-    # Running both and merging costs one more sobel threshold pass -- the sobel itself
-    # is already computed -- and keeps the better score from each.
     for thresh in XY_EDGE_THRESHOLDS:
         edges = mag > thresh
         # Bridge the sub-pixel gaps between glyph strokes so a text line reads as one
         # continuous ink run instead of a picket fence of blank columns.
         ink = ndimage.maximum_filter(edges, size=(2, 3), mode="constant", cval=False)
-        _xycut(ink, 0, 0, 0, nodes, min_gap, min_side, 7)
+        for rx, ry, rw, rh in regions:
+            _xycut(ink[ry:ry + rh, rx:rx + rw], rx, ry, 0, nodes,
+                   min_gap, min_side, 7)
 
     boxes: list[Box] = []
     for x, y, w, h, _depth in nodes:
@@ -1476,12 +1500,19 @@ def main() -> int:
                 futures["rects"] = pool.submit(
                     source_rects, frame, mon.scale, args.detect_width, v
                 )
-            if "xycut" in sources:
-                futures["xycut"] = pool.submit(
-                    source_xycut, frame, mon.scale, args.detect_width, v
-                )
+            # Window rects first: source_xycut needs them as seeds, and they are
+            # free (a hyprctl call), so this costs nothing but ordering.
             if "windows" in sources:
                 boxes += source_windows(mon)
+            if "xycut" in sources:
+                futures["xycut"] = pool.submit(
+                    source_xycut,
+                    frame,
+                    mon.scale,
+                    args.detect_width,
+                    v,
+                    [b for b in boxes if b.tier == "window"],
+                )
             for name, fut in futures.items():
                 try:
                     boxes += fut.result()
