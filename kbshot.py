@@ -89,6 +89,7 @@ TIER_ORDER = [
     "xy-pane",
     "block",
     "xy-group",
+    "band",
     "para",
     "rect-loose",
     "line",
@@ -776,6 +777,149 @@ def _xycut(
                            max(2, min_gap // 2), min_side, max_depth)
 
 
+# A background band must differ from its neighbours by at least this many luma levels
+# to count as a real step. Light-theme table striping measures 3-8 levels here, well
+# under any usable sobel threshold, which is exactly why this channel exists.
+BAND_STEP_MIN = 2.0
+# ...and rows within one band must agree to within this, so a gradient drifts rather
+# than stepping and produces no bands at all.
+BAND_FLAT_TOL = 1.5
+
+
+def _bg_profile(grey: np.ndarray, ink: np.ndarray, axis: int) -> np.ndarray:
+    """Median of the NON-ink pixels along `axis` -- i.e. the background colour.
+
+    The median is the whole point: it throws away glyphs, anti-aliasing and the odd
+    icon, so what survives is the paint behind the content. A mean would be dragged
+    around by how much text a row happens to contain.
+    """
+    masked = np.where(ink, np.nan, grey)
+    with np.errstate(all="ignore"):
+        prof = np.nanmedian(masked, axis=axis)
+    # A row that is entirely ink has no background; carry the neighbouring value
+    # rather than leaving a hole that would read as a step.
+    bad = ~np.isfinite(prof)
+    if bad.all():
+        return np.zeros_like(prof)
+    idx = np.arange(prof.size)
+    prof[bad] = np.interp(idx[bad], idx[~bad], prof[~bad])
+    return prof
+
+
+def _flat_bands(prof: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    """Maximal runs where the profile is flat, split where it steps."""
+    bands: list[tuple[int, int]] = []
+    start = 0
+    for i in range(1, prof.size):
+        if abs(prof[i] - prof[i - 1]) > BAND_FLAT_TOL:
+            if i - start >= min_len:
+                bands.append((start, i))
+            start = i
+    if prof.size - start >= min_len:
+        bands.append((start, prof.size))
+    return bands
+
+
+def source_bands(
+    png: Path,
+    scale: float,
+    detect_width: int,
+    verbose: bool,
+    seeds: list[Box] | None = None,
+) -> list[Box]:
+    """Regions whose only signal is a faint background tint.
+
+    A third kind of boundary, invisible to the other three sources. Tesseract sees
+    text, the sobel pass sees drawn edges, and XY-cut sees whitespace -- but a table's
+    zebra striping, a tinted code block and a callout panel are none of those. They
+    are a *painted background*, differing from the page by a handful of luma levels:
+    far too little for any edge threshold that is not also picking up noise, yet
+    perfectly crisp once you look at the background colour directly.
+
+    This is why light-theme table rows scored 0/14 while dark-theme rows scored 13/14.
+    It is also the reason the extents were wrong rather than merely missing: a row's
+    ink may start a third of the way across, but the painted stripe spans the whole
+    table, and the stripe is what a person means by "that row".
+    """
+    img = Image.open(png).convert("L")
+    f = min(1.0, detect_width / img.width)
+    if f < 1.0:
+        img = img.resize((round(img.width * f), round(img.height * f)), Image.BILINEAR)
+    grey = np.asarray(img, dtype=np.float32)
+    dh, dw = grey.shape
+
+    gx = ndimage.sobel(grey, axis=1)
+    gy = ndimage.sobel(grey, axis=0)
+    # Dilated generously: the median must not see glyph interiors, only paint.
+    ink = ndimage.maximum_filter(np.hypot(gx, gy) > 40.0, size=(5, 5), mode="constant",
+                                 cval=False)
+
+    to_logical = 1.0 / (scale * f)
+    min_side = max(6, round(12 * scale * f))
+
+    regions: list[tuple[int, int, int, int]] = [(0, 0, dw, dh)]
+    for b in seeds or []:
+        x0 = max(0, min(dw - 1, round(b.x * scale * f)))
+        y0 = max(0, min(dh - 1, round(b.y * scale * f)))
+        x1 = max(x0 + 1, min(dw, round((b.x + b.w) * scale * f)))
+        y1 = max(y0 + 1, min(dh, round((b.y + b.h) * scale * f)))
+        if (x1 - x0) >= min_side * 2 and (y1 - y0) >= min_side * 2:
+            regions.append((x0, y0, x1 - x0, y1 - y0))
+
+    boxes: list[Box] = []
+    for rx, ry, rw, rh in regions:
+        g = grey[ry:ry + rh, rx:rx + rw]
+        k = ink[ry:ry + rh, rx:rx + rw]
+        rows = _bg_profile(g, k, 1)
+        bands = _flat_bands(rows, min_side)
+        if len(bands) < 2:
+            continue
+
+        kept: list[tuple[int, int, int, int, float]] = []
+        for a, b in bands:
+            level = float(np.median(rows[a:b]))
+            # Must actually step away from at least one neighbour, or this is just a
+            # slice of uniform page and not a region at all.
+            neigh = [float(np.median(rows[p:q])) for p, q in bands if (p, q) != (a, b)]
+            if not any(abs(level - n) >= BAND_STEP_MIN for n in neigh):
+                continue
+            # Horizontal extent of the paint: the longest run of columns whose own
+            # background matches this band. This is what recovers the full stripe
+            # width when the row's ink covers only part of it.
+            cols = _bg_profile(g[a:b, :], k[a:b, :], 0)
+            match = np.abs(cols - level) <= max(BAND_FLAT_TOL, BAND_STEP_MIN - 0.5)
+            best_len = best_start = 0
+            cur = 0
+            for i, m in enumerate(match):
+                cur = cur + 1 if m else 0
+                if cur > best_len:
+                    best_len, best_start = cur, i - cur + 1
+            if best_len < min_side:
+                continue
+            kept.append((best_start, a, best_len, b - a, level))
+
+        for bx, by, bw, bh, _lvl in kept:
+            lw, lh = bw * to_logical, bh * to_logical
+            if lw < 24 or lh < 14:
+                continue
+            boxes.append(Box(round((rx + bx) * to_logical), round((ry + by) * to_logical),
+                             round(lw), round(lh), "band"))
+
+        # The alternating run itself is a region too -- that is the whole table, or the
+        # whole striped list, which is a thing people screenshot as a unit.
+        if len(kept) >= 3:
+            xs = min(k2[0] for k2 in kept)
+            xe = max(k2[0] + k2[2] for k2 in kept)
+            ys = min(k2[1] for k2 in kept)
+            ye = max(k2[1] + k2[3] for k2 in kept)
+            boxes.append(Box(round((rx + xs) * to_logical), round((ry + ys) * to_logical),
+                             round((xe - xs) * to_logical), round((ye - ys) * to_logical),
+                             "band"))
+
+    log(verbose, f"bands: {len(boxes)} regions from {len(regions)} seeds")
+    return boxes
+
+
 def source_xycut(
     png: Path,
     scale: float,
@@ -1332,8 +1476,8 @@ def main() -> int:
     ap.add_argument(
         "-s",
         "--sources",
-        default="windows,text,rects,xycut",
-        help="comma-separated: windows,text,rects,xycut (default: all)",
+        default="windows,text,rects,xycut,bands",
+        help="comma-separated: windows,text,rects,xycut,bands (default: all)",
     )
     ap.add_argument(
         "--fast",
@@ -1490,7 +1634,7 @@ def main() -> int:
 
         # Text and rect detection are both CPU-bound and independent; overlapping
         # them keeps the wait close to the slower of the two rather than the sum.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
             if "text" in sources:
                 futures["text"] = pool.submit(
@@ -1504,14 +1648,14 @@ def main() -> int:
             # free (a hyprctl call), so this costs nothing but ordering.
             if "windows" in sources:
                 boxes += source_windows(mon)
+            win_seeds = [b for b in boxes if b.tier == "window"]
             if "xycut" in sources:
                 futures["xycut"] = pool.submit(
-                    source_xycut,
-                    frame,
-                    mon.scale,
-                    args.detect_width,
-                    v,
-                    [b for b in boxes if b.tier == "window"],
+                    source_xycut, frame, mon.scale, args.detect_width, v, win_seeds
+                )
+            if "bands" in sources:
+                futures["bands"] = pool.submit(
+                    source_bands, frame, mon.scale, args.detect_width, v, win_seeds
                 )
             for name, fut in futures.items():
                 try:

@@ -28,15 +28,17 @@ grim ──> frozen frame
            ├─ hyprctl clients ──────> window rectangles          (free, exact)
            ├─ tesseract --psm 3 ────> block / para / line / word (layout TSV)
            ├─ sobel + components ───> drawn rectangles, 2 radii  (cards, images)
-           └─ recursive XY-cut ─────> whitespace-defined regions  (messages, paragraphs,
-                                                                   columns, table rows)
+           ├─ recursive XY-cut ─────> whitespace-defined regions  (messages, paragraphs,
+           │                                                       columns, code blocks)
+           └─ background medians ───> painted-tint regions        (table rows, panels,
+                                                                   callouts)
            │
       IoU dedupe ──> per-tier budget ──> label placement ──> wl-kbptr floating mode
            │
       type a label ──> crop at native resolution ──> clipboard + file + notification
 ```
 
-The interesting part is the fourth source. Tesseract finds *text* and the sobel pass
+The interesting part is the last two sources. Tesseract finds *text* and the sobel pass
 finds *drawn boxes*, but neither can see a region defined purely by the whitespace
 around it — and a chat message, a paragraph, a card and a table row are all exactly
 that. A Slack message has no border, and to tesseract its author line, timestamp and
@@ -67,6 +69,23 @@ clean documents:
   found **2** regions where per-window cutting finds **166**. Single-app test scenes have
   no chrome and hide this completely, which is a standing argument for checking every
   synthetic result against a real screen.
+
+### Background bands
+
+Three of the four sources look for *contrast*: glyphs, drawn edges, whitespace. A fourth
+kind of boundary has none — a table's zebra striping, a tinted code block, a callout
+panel. Those are a painted background differing from the page by a handful of luma
+levels, far too little for any edge threshold that is not also picking up noise.
+
+So this channel ignores edges and reads the background colour directly: mask out the ink,
+then take the **median** of the remaining pixels per row. The median is the point — it
+discards glyphs and anti-aliasing, so a 4-level stripe that sobel can never see becomes a
+clean step function. Bands are flat runs split at the steps; each band's horizontal extent
+comes from the same median trick over columns, which is what recovers the *full stripe
+width* when a row's ink only covers part of it.
+
+Measured effect: table rows went from 0/14 in light themes and 13/14 in dark to **14/14 in
+both**, for 17 extra candidates and ~30ms.
 
 ## Labels
 
@@ -130,16 +149,16 @@ regions from the draw calls, so the annotations are exact rather than eyeballed.
 
 **Semantic** — is the region actually offered, and what does it cost to reach?
 
-| | before XY-cut | after |
-|---|---|---|
-| primary recall @ IoU 0.70 | 45.8% | **81.9%** |
-| primary recall @ IoU 0.50 | 60.0% | **92.9%** |
-| median best IoU | 0.622 | **0.907** |
-| mean keystrokes to a target | 1.95 | 1.99 |
+| | text + rects only | + XY-cut | + background bands |
+|---|---|---|---|
+| primary recall @ IoU 0.70 | 45.8% | 81.9% | **91.6%** |
+| primary recall @ IoU 0.50 | 60.0% | 92.9% | **98.1%** |
+| median best IoU | 0.622 | 0.907 | **0.930** |
+| mean keystrokes to a target | 1.95 | 1.99 | 2.03 |
 
-By region kind, after: paragraph 26/26, code-block 8/8, terminal-output 10/10,
-column 6/6, pane 6/6, concentric 5/5, heading 4/4, figure 4/4, card 18/20,
-message 16/18, chart 8/12, table-row 13/28.
+By region kind, after: table-row 28/28, paragraph 26/26, code-block 8/8,
+terminal-output 10/10, column 6/6, pane 6/6, concentric 5/5, heading 4/4, figure 4/4,
+card 18/20, message 14/18, chart 7/12, message-group 0/2.
 
 **Structural** — invariants that must hold on *any* screen, needing no annotation:
 no two labels may overlap, every offered region clears the minimum size, labels are
@@ -161,11 +180,11 @@ rendered overlay was visibly carpeted and mean keystrokes rose to 2.54. The defa
 | 324 | 83.9% | 93.5% | 8.5% | 2.54 |
 
 On 30 real desktop captures all four structural counters stay 0, chips cover a median
-5.4% of the screen (max 7.5%), and median latency is 0.63s.
+5.5% of the screen (max 7.4%), and median latency is 0.69s.
 
-Known weak spots: table rows in light themes, where faint row striping means the
-full-width table region never forms and rows are only offered as sub-spans (dark themes
-score 13/14); runs of consecutive same-author chat messages (`message-group` 0/2); and on
+Known weak spots: runs of consecutive same-author chat messages (`message-group` 0/2);
+`chart` 7/12 and `message` 14/18, both of which lost a point or two to candidates the
+bands channel added, which is the eviction effect the budget table below describes; and on
 a very dense list view the chips do cover content — `--max 120` drops coverage to 3.2% if
 you prefer a calmer overlay.
 
