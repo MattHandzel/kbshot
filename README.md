@@ -58,6 +58,15 @@ clean documents:
   modest size, so any threshold derived from the widest gap in the region discards every
   one of them. Cutting at the widest, a typical, and the smallest gutter yields the
   section, row and line decompositions as alternatives.
+- **Cut inside each window, not across the whole screen.** This one only shows up on a
+  real desktop, and it is the difference between the source working and not working. Run
+  screen-wide, persistent chrome bridges every gutter: a row of pixels through the empty
+  middle of the screen still crosses a full-height browser sidebar, and a column still
+  crosses the full-width taskbar, so neither projection ever falls under the blank
+  tolerance and nothing is cut at all. Measured on a live frame, screen-level cutting
+  found **2** regions where per-window cutting finds **166**. Single-app test scenes have
+  no chrome and hide this completely, which is a standing argument for checking every
+  synthetic result against a real screen.
 
 ## Labels
 
@@ -151,9 +160,14 @@ rendered overlay was visibly carpeted and mean keystrokes rose to 2.54. The defa
 | **280** | **81.9%** | **92.9%** | **7.4%** | **1.99** |
 | 324 | 83.9% | 93.5% | 8.5% | 2.54 |
 
-Known weak spot: table rows in light themes, where faint row striping means the
-full-width table region never forms and rows are only offered as sub-spans. Rows in
-dark themes score 13/14.
+On 30 real desktop captures all four structural counters stay 0, chips cover a median
+5.4% of the screen (max 7.5%), and median latency is 0.63s.
+
+Known weak spots: table rows in light themes, where faint row striping means the
+full-width table region never forms and rows are only offered as sub-spans (dark themes
+score 13/14); runs of consecutive same-author chat messages (`message-group` 0/2); and on
+a very dense list view the chips do cover content — `--max 120` drops coverage to 3.2% if
+you prefer a calmer overlay.
 
 ## Not stacking overlays
 
